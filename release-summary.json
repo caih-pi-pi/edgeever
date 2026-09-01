@@ -1,0 +1,11 @@
+{
+  "version": "1.51.1",
+  "changes": {
+    "en-US": [
+      "Restore the macOS, Windows, Android, and iOS icons in the desktop download menu."
+    ],
+    "zh-CN": [
+      "修复桌面端下载菜单中 macOS、Windows、Android 和 iOS 图标无法显示的问题。"
+    ]
+  }
+}

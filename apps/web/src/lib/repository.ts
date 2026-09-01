@@ -39,8 +39,9 @@ import {
   type LocalMemoListParams,
   type LocalMemoListResponse,
 } from "@/lib/local-mirror";
-import { discardWebMemoConflict, getMemoUpdateQueueId, queueLocalAction, queueMemoCreate, queueMemoDelete, queueMemoRestore, queueMemoUpdate } from "@/lib/sync-queue";
+import { discardWebMemoConflict, getMemoUpdateQueueId, putMemoUpdateQueueItem, queueLocalAction, queueMemoCreate, queueMemoDelete, queueMemoRestore, queueMemoUpdate } from "@/lib/sync-queue";
 import { localDb, type MemoUpdateSyncPayload } from "@/lib/local-db";
+import { runLocalDatabaseOperationWithRecovery } from "@/lib/local-database-recovery";
 import { createDesktopRepository } from "@/lib/desktop-repository";
 import { isBrowserOffline } from "@/lib/network-status";
 import { notifySyncQueueDeferred } from "@/lib/sync-events";
@@ -104,6 +105,44 @@ const cacheMemoWithoutBlocking = (scope: string, memo: MemoDetail) => {
 const hasActiveLocalMemoUpdate = async (memoId: string) => {
   const item = await localDb.syncQueue.get(getMemoUpdateQueueId(memoId));
   return isActiveLocalMemoUpdateStatus(item?.status);
+};
+
+const reconcileLocalTemplates = async (
+  scope: string,
+  remoteTemplates: MemoTemplate[],
+): Promise<MemoTemplate[]> => {
+  const [local, queuedItems] = await Promise.all([
+    listLocalTemplates(scope),
+    localDb.syncQueue.filter((item) => item.scope === scope && item.kind.startsWith("template.")).toArray(),
+  ]);
+  const localById = new Map(local.templates.map((template) => [template.id, template]));
+  const pendingUpsertIds = new Set(
+    queuedItems
+      .filter((item) => item.kind === "template.create" || item.kind === "template.update")
+      .map((item) => item.memoId),
+  );
+  const pendingDeleteIds = new Set(
+    queuedItems.filter((item) => item.kind === "template.delete").map((item) => item.memoId),
+  );
+  const reconciled = new Map<string, MemoTemplate>();
+
+  for (const remote of remoteTemplates) {
+    if (pendingDeleteIds.has(remote.id)) continue;
+    reconciled.set(remote.id, pendingUpsertIds.has(remote.id) ? localById.get(remote.id) ?? remote : remote);
+  }
+  for (const templateId of pendingUpsertIds) {
+    const localTemplate = localById.get(templateId);
+    if (localTemplate) reconciled.set(templateId, localTemplate);
+  }
+
+  const templates = [...reconciled.values()].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  await localDb.transaction("rw", localDb.templates, async () => {
+    await localDb.templates.where("scope").equals(scope).delete();
+    if (templates.length > 0) {
+      await localDb.templates.bulkPut(templates.map((template) => ({ ...template, scope })));
+    }
+  });
+  return templates;
 };
 
 /**
@@ -187,13 +226,13 @@ export const createWebRepository = (scope: string): EdgeEverRepository => {
 
   async listTemplates() {
     const local = await listLocalTemplates(scope);
-    if (local.templates.length > 0 || isOffline()) {
-      if (!isOffline()) void api.listTemplates().then((remote) => Promise.all(remote.templates.map((template) => putLocalTemplate(scope, template)))).catch(() => {});
+    if (isOffline()) return local;
+    try {
+      const remote = await api.listTemplates();
+      return { templates: await reconcileLocalTemplates(scope, remote.templates) };
+    } catch {
       return local;
     }
-    const remote = await api.listTemplates();
-    await Promise.all(remote.templates.map((template) => putLocalTemplate(scope, template)));
-    return remote;
   },
   createTemplate: async (input) => {
     const template = await createLocalTemplate(scope, input);
@@ -350,6 +389,7 @@ export const createWebRepository = (scope: string): EdgeEverRepository => {
       notebookId: params.notebookId,
       includeDescendants: Boolean(params.notebookIds?.length),
       q: params.q,
+      tag: params.tag,
       trash: params.trash,
       filter: params.filter,
       sort: params.sort,
@@ -433,8 +473,13 @@ export const createWebRepository = (scope: string): EdgeEverRepository => {
 
   async updateMemo(memo, input) {
     const payload: MemoUpdateSyncPayload = { ...input, memoId: memo.id };
-    const updated = await putLocalMemoUpdate(scope, memo, payload);
-    await queueMemoUpdate(payload, scope);
+    const updated = await runLocalDatabaseOperationWithRecovery(() =>
+      localDb.transaction("rw", [localDb.memos, localDb.syncQueue], async () => {
+        const nextMemo = await putLocalMemoUpdate(scope, memo, payload);
+        await putMemoUpdateQueueItem(payload, scope);
+        return nextMemo;
+      })
+    );
     notifySyncQueueDeferred();
     return { memo: updated, queued: true };
   },

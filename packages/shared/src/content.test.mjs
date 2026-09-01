@@ -6,7 +6,10 @@ import {
   markdownToDoc,
   MERGE_DIVIDER_MARKDOWN_MARKER,
   MERGE_DIVIDER_NODE_TYPE,
+  FILE_ATTACHMENT_NODE_TYPE,
+  PDF_ATTACHMENT_NODE_TYPE,
   mergeMemoDocs,
+  resolvePdfDisplayMode,
   resolveMemoContentDoc,
   resolveMemoContentMarkdown,
   resolveMergedMemoTitle,
@@ -23,6 +26,147 @@ describe("merged memo title", () => {
   test("uses a dated merge title when every source is untitled", () => {
     expect(resolveMergedMemoTitle(undefined, [{ title: null }, { title: "无标题笔记" }], new Date(2026, 7, 2)))
       .toBe("合并笔记 2026/8/2");
+  });
+});
+
+describe("PDF attachment Markdown compatibility", () => {
+  test("parses a standalone PDF link as a viewer node and preserves the link on export", () => {
+    const markdown = "[Attachment: report.pdf](/api/v1/resources/res_pdf/blob)";
+    const doc = markdownToDoc(markdown);
+
+    expect(doc.content[0]).toMatchObject({
+      type: "paragraph",
+      content: [{
+        type: PDF_ATTACHMENT_NODE_TYPE,
+        attrs: {
+          label: "Attachment: report.pdf",
+          url: "/api/v1/resources/res_pdf/blob",
+          displayMode: "compact",
+        },
+      }],
+    });
+    expect(docToMarkdown(doc)).toBe(markdown);
+  });
+
+  test("upgrades a legacy standalone PDF link paragraph", () => {
+    const legacyDoc = {
+      type: "doc",
+      content: [{
+        type: "paragraph",
+        content: [{
+          type: "text",
+          text: "Attachment: archive.pdf",
+          marks: [{ type: "link", attrs: { href: "/api/v1/resources/res_archive/blob" } }],
+        }],
+      }],
+    };
+
+    expect(resolveMemoContentDoc(legacyDoc, "").content[0]?.content?.[0]?.type).toBe(PDF_ATTACHMENT_NODE_TYPE);
+  });
+
+  test("preserves native attachment metadata when upgrading a PDF link", () => {
+    const doc = resolveMemoContentDoc({
+      type: "doc",
+      content: [{
+        type: "paragraph",
+        content: [{
+          type: "text",
+          text: "附件：报告.pdf",
+          marks: [{
+            type: "link",
+            attrs: {
+              href: "/api/v1/resources/res_pdf/blob",
+              class: "edgeever-attachment-link edgeever-attachment-kind-pdf",
+              attachmentFilename: "报告.pdf",
+              attachmentMimeType: "application/pdf",
+              attachmentByteSize: 12582912,
+            },
+          }],
+        }],
+      }],
+    }, "");
+
+    expect(doc.content[0]?.content?.[0]).toMatchObject({
+      type: PDF_ATTACHMENT_NODE_TYPE,
+      attrs: {
+        filename: "报告.pdf",
+        mimeType: "application/pdf",
+        byteSize: 12582912,
+      },
+    });
+  });
+
+  test("renders PDF links nested in Markdown lists", () => {
+    const doc = markdownToDoc("- [Product brief.pdf](/api/v1/resources/res_pdf/blob)");
+    expect(doc.content[0]?.content?.[0]?.content?.[0]?.content?.[0]?.type).toBe(PDF_ATTACHMENT_NODE_TYPE);
+  });
+
+  test("defaults legacy values to compact and accepts the persisted inline mode", () => {
+    expect(resolvePdfDisplayMode(undefined)).toBe("compact");
+    expect(resolvePdfDisplayMode("expanded")).toBe("compact");
+    expect(resolvePdfDisplayMode("inline")).toBe("inline");
+  });
+
+  test("keeps a per-attachment display mode in rich content without changing Markdown", () => {
+    const richDoc = {
+      type: "doc",
+      content: [{
+        type: "paragraph",
+        content: [{
+          type: PDF_ATTACHMENT_NODE_TYPE,
+          attrs: {
+            label: "Attachment: report.pdf",
+            url: "/api/v1/resources/res_pdf/blob",
+            displayMode: "inline",
+          },
+        }],
+      }],
+    };
+
+    expect(resolveMemoContentDoc(richDoc, "[Attachment: report.pdf](/api/v1/resources/res_pdf/blob)"))
+      .toEqual(richDoc);
+    expect(docToMarkdown(richDoc)).toBe("[Attachment: report.pdf](/api/v1/resources/res_pdf/blob)");
+  });
+});
+
+describe("file attachment Markdown compatibility", () => {
+  test("parses a stored non-PDF resource link as an attachment card", () => {
+    const markdown = "[Attachment: budget.xlsx](/api/v1/resources/res_sheet/blob)";
+    const doc = markdownToDoc(markdown);
+
+    expect(doc.content[0]).toMatchObject({
+      type: "paragraph",
+      content: [{
+        type: FILE_ATTACHMENT_NODE_TYPE,
+        attrs: {
+          label: "Attachment: budget.xlsx",
+          filename: "budget.xlsx",
+          url: "/api/v1/resources/res_sheet/blob",
+        },
+      }],
+    });
+    expect(docToMarkdown(doc)).toBe(markdown);
+  });
+
+  test("keeps an ordinary standalone web link as text", () => {
+    const doc = markdownToDoc("[EdgeEver](https://edgeever.org)");
+    expect(doc.content[0]?.content?.[0]?.type).toBe("text");
+  });
+
+  test("upgrades a legacy standalone attachment link from rich content", () => {
+    const legacyDoc = {
+      type: "doc",
+      content: [{
+        type: "paragraph",
+        content: [{
+          type: "text",
+          text: "附件：archive.zip",
+          marks: [{ type: "link", attrs: { href: "/api/v1/resources/res_archive/blob" } }],
+        }],
+      }],
+    };
+
+    expect(resolveMemoContentDoc(legacyDoc, "").content[0]?.content?.[0]?.type).toBe(FILE_ATTACHMENT_NODE_TYPE);
   });
 });
 
@@ -127,6 +271,51 @@ describe("Nested list Markdown conversion", () => {
   });
 });
 
+describe("Markdown task list conversion", () => {
+  const markdown = [
+    "- [ ] Pending task",
+    "- [x] Completed task",
+    "  - [ ] Nested task",
+  ].join("\n");
+
+  test("preserves checked state and nesting through a Markdown round trip", () => {
+    const doc = markdownToDoc(markdown);
+    const taskList = doc.content[0];
+
+    expect(taskList?.type).toBe("taskList");
+    expect(taskList?.content?.[0]).toMatchObject({
+      type: "taskItem",
+      attrs: { checked: false },
+    });
+    expect(taskList?.content?.[1]).toMatchObject({
+      type: "taskItem",
+      attrs: { checked: true },
+    });
+    expect(taskList?.content?.[1]?.content?.[1]?.type).toBe("taskList");
+    expect(docToMarkdown(doc)).toBe(markdown);
+  });
+
+  test("recovers task semantics retained only in the Markdown compatibility copy", () => {
+    const legacyDoc = {
+      type: "doc",
+      content: [{
+        type: "bulletList",
+        content: [{
+          type: "listItem",
+          content: [{ type: "paragraph", content: [{ type: "text", text: "Pending task" }] }],
+        }],
+      }],
+    };
+
+    const resolved = resolveMemoContentDoc(legacyDoc, "- [ ] Pending task");
+    expect(resolved.content[0]?.type).toBe("taskList");
+    expect(resolved.content[0]?.content?.[0]).toMatchObject({
+      type: "taskItem",
+      attrs: { checked: false },
+    });
+  });
+});
+
 describe("Mermaid Markdown conversion", () => {
   const markdown = "```mermaid\nflowchart LR\n  A --> B\n```";
 
@@ -138,6 +327,47 @@ describe("Mermaid Markdown conversion", () => {
       attrs: { language: "mermaid" },
     });
     expect(docToMarkdown(doc)).toBe(markdown);
+  });
+});
+
+describe("LaTeX Markdown conversion", () => {
+  const markdown = "Euler: $e^{i\\pi}+1=0$.\n\n$$\n\\frac{a}{b}\n$$";
+
+  test("round-trips inline and block formula nodes", () => {
+    const doc = markdownToDoc(markdown);
+
+    expect(doc.content[0]?.content?.[1]).toMatchObject({
+      type: "inlineMath",
+      attrs: { latex: "e^{i\\pi}+1=0" },
+    });
+    expect(doc.content[1]).toMatchObject({
+      type: "blockMath",
+      attrs: { latex: "\\frac{a}{b}" },
+    });
+    expect(docToMarkdown(doc)).toBe(markdown);
+    expect(docToText(doc)).toContain("e^{i\\pi}+1=0");
+    expect(docToText(doc)).toContain("\\frac{a}{b}");
+  });
+
+  test("keeps currency and escaped dollar pairs as literal text", () => {
+    const doc = markdownToDoc("Price: $100$; literal: \\$x$.");
+    const serialized = docToMarkdown(doc);
+
+    expect(doc.content[0]?.content?.some((node) => node.type === "inlineMath")).toBe(false);
+    expect(serialized).toBe("Price: \\$100\\$; literal: \\$x\\$.");
+    expect(markdownToDoc(serialized)).toEqual(doc);
+  });
+
+  test("recovers formula nodes omitted by an older JSON schema", () => {
+    const legacyDoc = markdownToDoc("Euler: $e^{i\\pi}+1=0$.");
+    legacyDoc.content[0] = {
+      type: "paragraph",
+      content: [{ type: "text", text: "Euler: $e^{i\\pi}+1=0$." }],
+    };
+
+    const resolved = resolveMemoContentDoc(legacyDoc, markdown);
+    expect(resolved.content[0]?.content?.[1]?.type).toBe("inlineMath");
+    expect(resolved.content[1]?.type).toBe("blockMath");
   });
 });
 

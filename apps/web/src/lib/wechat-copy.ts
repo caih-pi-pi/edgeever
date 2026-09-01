@@ -1,6 +1,8 @@
 import type { Editor } from "@tiptap/react";
 import { MEMO_CONTENT_STYLE } from "@edgeever/shared";
 import { marked } from "marked";
+import { MERMAID_THEME_PALETTES } from "@/components/ThemeProvider";
+import { copyHtmlToClipboard } from "@/lib/clipboard";
 import { parseCustomCssToStyles } from "@/lib/css-sandbox";
 
 const BODY_LINE_HEIGHT = MEMO_CONTENT_STYLE.body.lineHeight / MEMO_CONTENT_STYLE.body.fontSize;
@@ -279,6 +281,7 @@ const renderMermaidSvg = async (source: string) => {
   const { renderMermaidSVG, THEMES } = await import("beautiful-mermaid");
   return renderMermaidSVG(source, {
     ...THEMES["zinc-light"],
+    ...MERMAID_THEME_PALETTES["zinc-light"],
     transparent: true,
     font: "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
     padding: 24,
@@ -384,31 +387,6 @@ export const buildWeChatClipboardHtml = async (editor: Editor) => {
   const originalImages = Array.from(editor.view.dom.querySelectorAll<HTMLImageElement>("img"));
   await embedImagesForWeChat(container, originalImages);
   return container.outerHTML;
-};
-
-const copyHtmlToClipboard = async (html: string, plainText: string) => {
-  if (navigator.clipboard && "ClipboardItem" in window) {
-    await navigator.clipboard.write([new ClipboardItem({
-      "text/html": new Blob([html], { type: "text/html" }),
-      "text/plain": new Blob([plainText], { type: "text/plain" }),
-    })]);
-    return;
-  }
-
-  const selection = window.getSelection();
-  const range = document.createRange();
-  const container = document.createElement("div");
-  container.setAttribute("contenteditable", "true");
-  container.style.cssText = "position: fixed; left: -99999px; top: 0;";
-  container.innerHTML = html;
-  document.body.appendChild(container);
-  range.selectNodeContents(container);
-  selection?.removeAllRanges();
-  selection?.addRange(range);
-  const copied = document.execCommand("copy");
-  selection?.removeAllRanges();
-  container.remove();
-  if (!copied) throw new Error("Clipboard copy was not available");
 };
 
 export const copyEditorToWeChat = async (editor: Editor) =>

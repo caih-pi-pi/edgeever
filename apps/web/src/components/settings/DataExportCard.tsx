@@ -1,5 +1,4 @@
 import { useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, CheckCircle2, DatabaseBackup, Download, Upload } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
@@ -14,14 +13,18 @@ import {
 } from "@/components/ui/dialog";
 import { api, ApiRequestError } from "@/lib/api";
 import {
-  createEdgeEverZip,
-  downloadEdgeEverZip,
   EdgeEverZipImportError,
+  EdgeEverZipMemoryLimitError,
   parseEdgeEverZip,
-  restoreEdgeEverZip,
+  restoreEdgeEverZipAndRefresh,
+  saveEdgeEverZip,
   type EdgeEverZipProgress,
   type ParsedEdgeEverZip,
 } from "@/lib/json-backup";
+
+type DataExportCardProps = {
+  refreshWorkspaceAfterImport: () => Promise<void>;
+};
 
 type OperationState = "idle" | "working" | "complete" | "error";
 type OperationKind = "export" | "import";
@@ -35,12 +38,12 @@ const Progress = ({ progress }: { progress: EdgeEverZipProgress }) => {
   );
 };
 
-export const DataExportCard = () => {
+export const DataExportCard = ({ refreshWorkspaceAfterImport }: DataExportCardProps) => {
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [state, setState] = useState<OperationState>("idle");
   const [operation, setOperation] = useState<OperationKind>("export");
+  const [scanningImport, setScanningImport] = useState(false);
   const [progress, setProgress] = useState<EdgeEverZipProgress>({ completed: 0, total: 0 });
   const [pendingImport, setPendingImport] = useState<ParsedEdgeEverZip | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -74,18 +77,24 @@ export const DataExportCard = () => {
     setOperation("export");
     setState("working");
     setProgress({ completed: 0, total: 0 });
+    setScanningImport(false);
     setErrorMessage(null);
     try {
-      const blob = await createEdgeEverZip(
-        { listNotebooks: api.listNotebooks, getPage: api.getJsonBackupPage, getResourceBlob: api.getResourceBlob },
+      await saveEdgeEverZip(
+        { listNotebooks: api.listNotebooks, listPrompts: api.listAiPrompts, getPage: api.getJsonBackupPage, getResourceResponse: api.getResourceResponse },
         { edgeeverVersion: __EDGEEVER_APP_VERSION__, buildId: __EDGEEVER_BUILD_ID__ },
         setProgress
       );
-      downloadEdgeEverZip(blob);
       setState("complete");
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        setState("idle");
+        return;
+      }
       console.error("Failed to export EdgeEver ZIP", error);
-      setErrorMessage(t("dataExport.error"));
+      setErrorMessage(error instanceof EdgeEverZipMemoryLimitError
+        ? t("dataExport.largeBackupRequiresStreaming")
+        : t("dataExport.error"));
       setState("error");
     }
   };
@@ -95,9 +104,12 @@ export const DataExportCard = () => {
     setOperation("import");
     setState("working");
     setProgress({ completed: 0, total: 0 });
+    setScanningImport(true);
     setErrorMessage(null);
     try {
-      const parsed = await parseEdgeEverZip(file);
+      const parsed = await parseEdgeEverZip(file, (percentage) => {
+        setProgress({ completed: percentage, total: 100 });
+      });
       setPendingImport(parsed);
       setState("idle");
     } catch (error) {
@@ -105,6 +117,7 @@ export const DataExportCard = () => {
       setErrorMessage(describeImportError(error));
       setState("error");
     } finally {
+      setScanningImport(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
@@ -116,18 +129,20 @@ export const DataExportCard = () => {
     setOperation("import");
     setState("working");
     setProgress({ completed: 0, total: 0 });
+    setScanningImport(false);
     setErrorMessage(null);
     try {
-      await restoreEdgeEverZip(
+      await restoreEdgeEverZipAndRefresh(
         archive,
         {
           restoreNotebooks: api.restoreJsonNotebooks,
           restoreMemos: api.restoreJsonMemos,
-          restoreResource: api.restoreJsonResource,
+          restorePrompts: api.restoreJsonAiPrompts,
+          createResourceRestoreSink: api.createJsonResourceRestoreSink,
         },
+        refreshWorkspaceAfterImport,
         setProgress
       );
-      await queryClient.invalidateQueries();
       setState("complete");
     } catch (error) {
       console.error("Failed to import EdgeEver ZIP", error);
@@ -168,8 +183,10 @@ export const DataExportCard = () => {
             {busy ? (
               <div className="grid gap-1.5" aria-live="polite">
                 <div className="flex items-center justify-between text-xs text-slate-500">
-                  <span>{operation === "import" ? t("dataExport.importing") : t("dataExport.working")}</span>
-                  <span>{t("dataExport.progress", { completed: progress.completed, total: progress.total })}</span>
+                  <span>{operation === "import" ? t(scanningImport ? "dataExport.scanning" : "dataExport.importing") : t("dataExport.working")}</span>
+                  <span>{scanningImport
+                    ? t("dataExport.scanProgress", { percentage: progress.completed })
+                    : t("dataExport.progress", { completed: progress.completed, total: progress.total })}</span>
                 </div>
                 <Progress progress={progress} />
               </div>

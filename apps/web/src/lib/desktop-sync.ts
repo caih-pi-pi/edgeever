@@ -1,6 +1,18 @@
-import type { DesktopOutboxItem, DesktopRpcParams, DesktopRpcResponses, SyncBootstrapResponse, SyncChangesResponse, TiptapDoc } from "@edgeever/shared";
+import {
+  getMemoSyncBaseConflictDetails,
+  getSyncRetryAt,
+  hasSyncStateReset,
+  isMemoSyncBaseCurrent,
+  type DesktopOutboxItem,
+  type DesktopRpcParams,
+  type DesktopRpcResponses,
+  type SyncBootstrapResponse,
+  type SyncChangesResponse,
+  type TiptapDoc,
+} from "@edgeever/shared";
 import { api, ApiRequestError } from "@/lib/api";
-import { isDesktopResourceRuntime } from "@/lib/desktop-resources";
+import { isDesktopResourceRuntime, mapMarkdownResourceUrls, mapTiptapResourceUrls, toApiResourceUrl } from "@/lib/desktop-resources";
+import { notifyMemoIdRemapped, notifyMemoSyncAcknowledged } from "@/lib/sync-events";
 
 type StagedResourceRewrite = { memoId: string; placeholder: string; url: string };
 let lastSyncFailed = false;
@@ -55,9 +67,15 @@ const syncStagedResources = async (memoIdMappings: Map<string, string>) => {
     // that the note content containing the placeholder has been saved.
     if (!isStagedResourceReferenced(pendingPayloads, item.id)) continue;
     try {
-      const stored = await window.edgeeverDesktop!.readStagedResource(item.id);
       const memoId = memoIdMappings.get(item.memoId) ?? item.memoId;
-      const uploaded = await api.uploadMemoResource(memoId, new File([stored.bytes as unknown as ArrayBuffer], stored.name, { type: stored.type }));
+      const uploaded = await api.uploadMemoResourceParts(memoId, {
+        filename: item.name,
+        mimeType: item.type,
+        byteSize: item.size,
+        readPart: async (start, end) => new Blob([
+          await window.edgeeverDesktop!.readStagedResourcePart(item.id, start, end - start),
+        ], { type: item.type }),
+      });
       await window.edgeeverDesktop!.sidecarRequest("resource.cache", { resource: uploaded.resource });
       rewrites.push({ memoId, placeholder: `edgeever-staged://${item.id}`, url: uploaded.resource.url });
       stagedIds.push(item.id);
@@ -97,6 +115,16 @@ export const rewriteStagedResource = (value: unknown, rewrites: StagedResourceRe
   }
   return value;
 };
+
+export const normalizeDesktopMemoPayload = (payload: Record<string, unknown>): Record<string, unknown> => ({
+  ...payload,
+  contentJson: payload.contentJson && typeof payload.contentJson === "object"
+    ? mapTiptapResourceUrls(payload.contentJson as TiptapDoc, toApiResourceUrl)
+    : payload.contentJson,
+  contentMarkdown: typeof payload.contentMarkdown === "string"
+    ? mapMarkdownResourceUrls(payload.contentMarkdown, toApiResourceUrl)
+    : payload.contentMarkdown,
+});
 
 const patchCreatedMemoResources = async (rewrites: StagedResourceRewrite[]) => {
   const memoIds = [...new Set(rewrites.map((rewrite) => rewrite.memoId))];
@@ -143,16 +171,28 @@ const request = async <M extends keyof DesktopRpcResponses>(method: M, params: D
   return bridge.sidecarRequest<DesktopRpcResponses[M]>(method, params);
 };
 
-const applyRemoteMemo = async (memo: NonNullable<DesktopRpcResponses["memo.get"]>["memo"]) => {
-  await request("sync.apply", {
-    changes: [{ entityType: "memo", operation: "upsert", entityId: memo.id, memo, notebook: null }],
-  });
-};
-
 const applyRemoteNotebook = async (notebook: DesktopRpcResponses["notebook.list"]["notebooks"][number]) => {
   await request("sync.apply", {
     changes: [{ entityType: "notebook", operation: "upsert", entityId: notebook.id, notebook, memo: null }],
   });
+};
+
+export const resolveDesktopMemoSyncBase = (
+  current: { revision: number; contentHash: string },
+  expected: { expectedRevision: number; expectedContentHash: string },
+) => {
+  // Older desktop clients advanced the cached cloud revision for every local
+  // autosave. A base ahead of the actual server is therefore a local counter,
+  // not evidence of a concurrent remote edit. Rebase that impossible state so
+  // existing drafts recover automatically. Bases behind the server remain
+  // conflicts and keep the normal adopt-cloud/copy-draft protection.
+  if (expected.expectedRevision > current.revision) {
+    return {
+      expectedRevision: current.revision,
+      expectedContentHash: current.contentHash,
+    };
+  }
+  return expected;
 };
 
 const acknowledge = async (
@@ -161,15 +201,17 @@ const acknowledge = async (
   remoteNotebook?: DesktopRpcResponses["notebook.list"]["notebooks"][number],
   remoteTemplate?: DesktopRpcResponses["template.list"]["templates"][number],
 ) => {
-  if (remoteMemo) await applyRemoteMemo(remoteMemo);
   if (remoteNotebook) await applyRemoteNotebook(remoteNotebook);
-  await request("sync.outbox.ack", { id: item.id, remoteMemo, remoteNotebook, remoteTemplate });
+  await request("sync.outbox.ack", { id: item.id, version: item.version, remoteMemo, remoteNotebook, remoteTemplate });
 };
 
 const syncOutboxItem = async (item: DesktopOutboxItem, stagedRewrites: StagedResourceRewrite[]) => {
-  const payload = stagedRewrites.length > 0
+  const rewrittenPayload = stagedRewrites.length > 0
     ? rewriteStagedResource(item.payload, stagedRewrites.filter((rewrite) => rewrite.memoId === String(item.payload.memoId ?? item.entityId))) as Record<string, unknown>
     : item.payload;
+  const payload = item.kind === "memo.create" || item.kind === "memo.update"
+    ? normalizeDesktopMemoPayload(rewrittenPayload)
+    : rewrittenPayload;
   if (item.kind === "memo.create") {
     const data = await api.createMemo({
       notebookId: String(payload.notebookId),
@@ -187,18 +229,23 @@ const syncOutboxItem = async (item: DesktopOutboxItem, stagedRewrites: StagedRes
     const memoId = String(payload.memoId ?? item.entityId);
     const editSessionResponse = await api.createMemoEditSession(memoId);
     const editSession = editSessionResponse.editSession;
-    if (editSession.baseRevision !== Number(payload.expectedRevision) || editSession.baseContentHash !== String(payload.expectedContentHash ?? "")) {
-      throw new ApiRequestError("Note changed before the offline draft could sync.", 409, "revision_conflict", {
-        expectedRevision: Number(payload.expectedRevision),
-        currentRevision: editSession.baseRevision,
-        expectedContentHash: String(payload.expectedContentHash ?? ""),
-        currentContentHash: editSession.baseContentHash,
-        source: "offline_sync",
-      });
-    }
-    const data = await api.updateMemo(memoId, {
+    const queuedBase = {
       expectedRevision: Number(payload.expectedRevision),
       expectedContentHash: String(payload.expectedContentHash ?? ""),
+    };
+    const currentBase = { revision: editSession.baseRevision, contentHash: editSession.baseContentHash };
+    const expectedBase = resolveDesktopMemoSyncBase(currentBase, queuedBase);
+    if (!isMemoSyncBaseCurrent(currentBase, expectedBase)) {
+      throw new ApiRequestError(
+        "Note changed before the offline draft could sync.",
+        409,
+        "revision_conflict",
+        getMemoSyncBaseConflictDetails(currentBase, expectedBase),
+      );
+    }
+    const data = await api.updateMemo(memoId, {
+      expectedRevision: expectedBase.expectedRevision,
+      expectedContentHash: expectedBase.expectedContentHash,
       editSessionId: editSession.id,
       title: String(payload.title ?? ""),
       contentJson: payload.contentJson as TiptapDoc,
@@ -341,23 +388,40 @@ const syncOutbox = async (stagedRewrites: StagedResourceRewrite[], onlyKinds?: S
   let conflicted = 0;
   const response = await request("sync.outbox.list", { limit: 100 });
   const memoIdMappings = new Map<string, string>();
+  const syncedMemos = new Map<string, DesktopRpcResponses["memo.get"]["memo"]>();
   for (const item of response.items) {
     if (onlyKinds && !onlyKinds.has(item.kind)) continue;
     try {
       const result = await syncOutboxItem(item, stagedRewrites);
       if (item.kind === "memo.create" && result && typeof result === "object" && "id" in result && typeof result.id === "string") {
         memoIdMappings.set(item.entityId, result.id);
+        // Remap the live editor and advance its cloud base as soon as the
+        // create is acknowledged. Waiting for the workspace-wide sync to end
+        // leaves a window where the next autosave still sends revision 0.
+        notifyMemoIdRemapped(new Map([[item.entityId, result.id]]));
+      }
+      if (result && typeof result === "object" && "id" in result && typeof result.id === "string" && "contentJson" in result) {
+        const syncedMemo = result as DesktopRpcResponses["memo.get"]["memo"];
+        syncedMemos.set(result.id, syncedMemo);
+        notifyMemoSyncAcknowledged(syncedMemo);
       }
       synced += 1;
     } catch (error) {
-      const conflict = error instanceof ApiRequestError
-        && (error.code === "revision_conflict" || error.code === "content_conflict" || error.code === "edit_session_conflict");
-      await request("sync.outbox.fail", { id: item.id, error: error instanceof Error ? error.message : String(error), conflict });
-      if (conflict) conflicted += 1;
+      const disposition = classifyDesktopSyncFailure(item, error);
+      await request("sync.outbox.fail", {
+        id: item.id,
+        version: item.version,
+        error: error instanceof Error ? error.message : String(error),
+        errorCode: disposition.errorCode,
+        conflict: disposition.conflict,
+        retryable: disposition.retryable,
+        nextAttemptAt: disposition.retryable ? getSyncRetryAt(item.attemptCount + 1) : null,
+      });
+      if (disposition.conflict) conflicted += 1;
       else failed += 1;
     }
   }
-  return { attempted: onlyKinds ? synced + failed + conflicted : response.items.length, synced, failed, conflicted, memoIdMappings };
+  return { attempted: onlyKinds ? synced + failed + conflicted : response.items.length, synced, failed, conflicted, memoIdMappings, syncedMemos };
 };
 
 const applyBootstrap = async (page: SyncBootstrapResponse) => {
@@ -367,6 +431,37 @@ const applyBootstrap = async (page: SyncBootstrapResponse) => {
   ];
   if (changes.length > 0) await request("sync.apply", { changes });
 };
+
+export const hasDesktopSyncStateReset = (
+  local: { cursor: number; syncIdentity: string },
+  remote: Pick<SyncChangesResponse, "serverCursor" | "syncIdentity">,
+) => hasSyncStateReset(local, remote);
+
+export const classifyDesktopSyncFailure = (item: Pick<DesktopOutboxItem, "kind">, error: unknown) => {
+  const conflict = error instanceof ApiRequestError
+    && (error.code === "revision_conflict" || error.code === "content_conflict" || error.code === "edit_session_conflict");
+  if (conflict) {
+    return { conflict: true, retryable: false, errorCode: error.code ?? "sync_conflict" };
+  }
+  if (error instanceof ApiRequestError) {
+    const missingMemo = item.kind === "memo.update" && error.status === 404;
+    return {
+      conflict: false,
+      retryable: !missingMemo && (error.status === 408 || error.status === 429 || error.status >= 500),
+      errorCode: missingMemo ? "memo_not_found" : error.code ?? `http_${error.status}`,
+    };
+  }
+  return {
+    conflict: false,
+    retryable: error instanceof TypeError,
+    errorCode: error instanceof TypeError ? "network_error" : "unexpected_sync_error",
+  };
+};
+
+export const shouldPullDesktopChanges = (
+  status: Pick<DesktopRpcResponses["sync.status"], "pending" | "syncing">,
+  online: boolean,
+) => online && status.pending === 0 && status.syncing === 0;
 
 export const orderBootstrapNotebooks = (notebooks: SyncBootstrapResponse["notebooks"]) => {
   const remaining = new Map(notebooks.map((notebook) => [notebook.id, notebook]));
@@ -389,31 +484,47 @@ export const orderBootstrapNotebooks = (notebooks: SyncBootstrapResponse["notebo
   return ordered;
 };
 
+const bootstrapDesktopMirror = async (reset: boolean) => {
+  await request("sync.bootstrap.prepare", reset ? { reset: true } : {});
+  let afterId: string | null = null;
+  let firstPage = true;
+  let snapshotCursor = 0;
+  let syncIdentity = "";
+  do {
+    const page = await api.syncBootstrap({ afterId, limit: 200 });
+    if (firstPage) {
+      snapshotCursor = page.snapshotCursor;
+      syncIdentity = page.syncIdentity ?? "";
+      firstPage = false;
+    }
+    await applyBootstrap(page);
+    afterId = page.nextAfterId;
+  } while (afterId);
+  await request("sync.cursor.set", { cursor: snapshotCursor, syncIdentity });
+};
+
 const pullRemoteChanges = async () => {
   const status = await request("sync.status", {});
   if (!status.syncIdentity) {
-    await request("sync.bootstrap.prepare", {});
-    let afterId: string | null = null;
-    let snapshotCursor = 0;
-    let syncIdentity = "";
-    do {
-      const page = await api.syncBootstrap({ afterId, limit: 200 });
-      if (!snapshotCursor) snapshotCursor = page.snapshotCursor;
-      syncIdentity = page.syncIdentity ?? syncIdentity;
-      await applyBootstrap(page);
-      afterId = page.nextAfterId;
-    } while (afterId);
-    await request("sync.cursor.set", { cursor: snapshotCursor, syncIdentity });
+    await bootstrapDesktopMirror(false);
     return;
   }
 
   let cursor = status.cursor;
   let response: SyncChangesResponse = await api.syncChanges({ cursor, limit: 200 });
+  if (hasDesktopSyncStateReset({ cursor: status.cursor, syncIdentity: status.syncIdentity }, response)) {
+    await bootstrapDesktopMirror(true);
+    return;
+  }
   while (response.changes.length > 0) {
     await request("sync.apply", { changes: response.changes });
     cursor = response.cursor;
     if (!response.hasMore) break;
     response = await api.syncChanges({ cursor, limit: 200 });
+    if (hasDesktopSyncStateReset({ cursor, syncIdentity: status.syncIdentity }, response)) {
+      await bootstrapDesktopMirror(true);
+      return;
+    }
   }
   await request("sync.cursor.set", { cursor: response.cursor ?? cursor, syncIdentity: response.syncIdentity ?? status.syncIdentity });
 };
@@ -424,6 +535,7 @@ export type DesktopSyncResult = {
   failed: number;
   conflicted: number;
   memoIdMappings: Map<string, string>;
+  syncedMemos: Map<string, DesktopRpcResponses["memo.get"]["memo"]>;
 };
 
 export const mergeMemoIdMappings = (
@@ -434,26 +546,37 @@ export const mergeMemoIdMappings = (
   return target;
 };
 
+export const mergeSyncedMemos = <T>(target: Map<string, T>, source: ReadonlyMap<string, T>) => {
+  for (const [memoId, memo] of source) target.set(memoId, memo);
+  return target;
+};
+
 let activeSync: Promise<DesktopSyncResult> | null = null;
 
 export const syncDesktopData = () => {
   if (activeSync) return activeSync;
   activeSync = (async () => {
     const memoIdMappings = new Map<string, string>();
+    const syncedMemos = new Map<string, DesktopRpcResponses["memo.get"]["memo"]>();
     if (typeof navigator !== "undefined" && !navigator.onLine) {
-      return { attempted: 0, synced: 0, failed: 0, conflicted: 0, memoIdMappings };
+      return { attempted: 0, synced: 0, failed: 0, conflicted: 0, memoIdMappings, syncedMemos };
     }
     try {
       const creates = await syncOutbox([], new Set(["memo.create"]));
       mergeMemoIdMappings(memoIdMappings, creates.memoIdMappings);
+      mergeSyncedMemos(syncedMemos, creates.syncedMemos);
       await remapStagedResourceMemoIds(creates.memoIdMappings);
       const stagedResources = await syncStagedResources(creates.memoIdMappings);
       const outbox = await syncOutbox(stagedResources.rewrites);
       mergeMemoIdMappings(memoIdMappings, outbox.memoIdMappings);
+      mergeSyncedMemos(syncedMemos, outbox.syncedMemos);
       if (stagedResources.failed === 0 && outbox.failed === 0 && outbox.conflicted === 0 && creates.conflicted === 0) {
         await removeSyncedStagedResources(stagedResources.stagedIds);
       }
-      if (outbox.conflicted === 0 && creates.conflicted === 0 && (typeof navigator === "undefined" || navigator.onLine)) await pullRemoteChanges();
+      const remaining = await request("sync.status", {});
+      // A durable failed or conflicted outbox item must not freeze unrelated
+      // remote changes. The payload remains recoverable while pulls continue.
+      if (shouldPullDesktopChanges(remaining, typeof navigator === "undefined" || navigator.onLine)) await pullRemoteChanges();
       // Catch resources staged while the network sync itself was running.
       await remapStagedResourceMemoIds(creates.memoIdMappings);
       lastSyncFailed = false;
@@ -463,6 +586,7 @@ export const syncDesktopData = () => {
         failed: creates.failed + outbox.failed + stagedResources.failed,
         conflicted: creates.conflicted + outbox.conflicted,
         memoIdMappings,
+        syncedMemos,
       };
     } catch (error) {
       lastSyncFailed = true;
@@ -470,7 +594,7 @@ export const syncDesktopData = () => {
       // A create may already have been acknowledged before a later upload or
       // pull failed. Preserve its id mapping so the UI cannot keep editing an
       // obsolete temporary id merely because the overall sync was partial.
-      return { attempted: 0, synced: 0, failed: 1, conflicted: 0, memoIdMappings };
+      return { attempted: 0, synced: 0, failed: 1, conflicted: 0, memoIdMappings, syncedMemos };
     }
   })().finally(() => { activeSync = null; });
   return activeSync;
@@ -482,8 +606,55 @@ export const getDesktopSyncSummary = async () => {
   return { total: status.pending + status.syncing + status.conflict + error, pending: status.pending, syncing: status.syncing, conflict: status.conflict, error };
 };
 
+export const getDesktopSyncIssues = async () => {
+  const response = await request("sync.outbox.list", { limit: 200, includeConflicts: true });
+  return response.items.filter((item) => item.status === "error" || item.status === "conflict");
+};
+
+export const retryDesktopSyncIssue = async (item: DesktopOutboxItem) => {
+  await request("sync.outbox.retry", { id: item.id, version: item.version });
+  window.dispatchEvent(new CustomEvent("edgeever:sync-queue-changed"));
+};
+
+export const discardDesktopSyncIssue = async (item: DesktopOutboxItem) => {
+  await request("sync.outbox.discard", { id: item.id, version: item.version });
+  window.dispatchEvent(new CustomEvent("edgeever:sync-queue-changed"));
+};
+
+export const recoverDesktopMemoUpdate = async (item: DesktopOutboxItem, notebookId: string) => {
+  const result = await request("sync.outbox.recoverMemoUpdate", { id: item.id, version: item.version, notebookId });
+  window.dispatchEvent(new CustomEvent("edgeever:sync-queue-changed"));
+  return result.memo;
+};
+
+const sanitizeDesktopSyncDiagnosticError = (value: string | null | undefined) => value
+  ? value
+      .slice(0, 200)
+      .replace(/https?:\/\/[^\s)\]}]+/gi, "[redacted-url]")
+      .replace(/\b(?:memo|notebook|template|resource)_[A-Za-z0-9_-]+\b/g, "[redacted-id]")
+      .replace(/\/Users\/[^/\s]+/g, "/Users/[redacted]")
+      .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [redacted]")
+  : value;
+
+export const createDesktopSyncDiagnosticText = (items: DesktopOutboxItem[]) => JSON.stringify({
+  generatedAt: new Date().toISOString(),
+  totalItemCount: items.length,
+  includedItemCount: Math.min(items.length, 5),
+  items: items.slice(0, 5).map((item) => ({
+    kind: item.kind,
+    status: item.status,
+    attemptCount: item.attemptCount,
+    lastError: sanitizeDesktopSyncDiagnosticError(item.lastError),
+    lastErrorCode: item.lastErrorCode,
+    retryable: item.retryable,
+    nextAttemptAt: item.nextAttemptAt,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+  })),
+}, null, 2);
+
 export const discardDesktopConflicts = async () => {
-  const response = await request("sync.outbox.list", { limit: 200 });
+  const response = await request("sync.outbox.list", { limit: 200, includeConflicts: true });
   const conflicts = response.items.filter((item) => item.status === "conflict");
   let discarded = 0;
 
@@ -496,7 +667,7 @@ export const discardDesktopConflicts = async () => {
       await request("sync.apply", {
         changes: [{ entityType: "memo", operation: "upsert", entityId: remote.memo.id, memo: remote.memo, notebook: null }],
       });
-      await request("sync.outbox.ack", { id: item.id, remoteMemo: remote.memo });
+      await request("sync.outbox.ack", { id: item.id, version: item.version, remoteMemo: remote.memo });
     } else {
       await request("sync.outbox.discard", { id: item.id });
     }
@@ -516,13 +687,13 @@ export const discardDesktopMemoConflict = async (memoId: string) => {
     changes: [{ entityType: "memo", operation: "upsert", entityId: remote.memo.id, memo: remote.memo, notebook: null }],
   });
 
-  const response = await request("sync.outbox.list", { limit: 200 });
+  const response = await request("sync.outbox.list", { limit: 200, includeConflicts: true });
   for (const item of response.items) {
     if (item.entityId !== memoId || item.status !== "conflict") {
       continue;
     }
     if (item.kind === "memo.update") {
-      await request("sync.outbox.ack", { id: item.id, remoteMemo: remote.memo });
+      await request("sync.outbox.ack", { id: item.id, version: item.version, remoteMemo: remote.memo });
     } else {
       await request("sync.outbox.discard", { id: item.id });
     }
